@@ -1,0 +1,7 @@
+.env
+*.env
+.venv/
+__pycache__/
+debug_log.txt
+debug_dump/
+*.pyc
