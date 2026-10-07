@@ -112,7 +112,23 @@ DEFAULT_CONFIG = {
         # this relay about 1.4s per 6k. 0 = off.
         "max_tool_result_chars": 32000,
         "max_output_tokens": 16000,     # cap on output; 0 = off
-        "cache_system_prefix": True,    # prompt-cache breakpoint on the system prefix
+
+        # A cache_control breakpoint on the last system block, which is where
+        # Anthropic's own clients put one (it covers the tools array too, since
+        # the cache prefix runs tools -> system -> messages).
+        #
+        # Kept on because it costs nothing, but do not expect it to buy speed.
+        # Measured against this relay on 2026-10-07: the cache read it reports
+        # is 10278 tokens whether the cacheable prefix is 1,336 chars or 13,569
+        # -- a constant, so it is the relay's own hidden prefix and never the
+        # conversation's -- and it appears on a random share of requests rather
+        # than after the first write. Without cache_control the relay reports
+        # cache_creation = input_tokens - 2 on every request, which is
+        # "everything was a write" and not a measurement of anything. Across 626
+        # logged turns nothing about a cache hit was ever visible in the wall
+        # time either. The dashboard's "Cache reads" card shows this live so it
+        # does not have to be re-measured.
+        "cache_system_prefix": True,
 
         # ---- behaviour ----
         "working_rules": True,          # tell the model to ask when stuck / when there is a choice
@@ -247,6 +263,13 @@ def make_rec(n, ctx, message=None, ok=True, status=0, note=""):
     bd = ctx.get("breakdown") or {}
     d = diff_counts(ctx.get("snap0") or {})
     usage = (message or {}).get("usage") or {}
+    # The cache numbers come from the RAW upstream usage, not from the usage
+    # block the client is handed. _usage_for_client strips
+    # cache_creation_input_tokens on purpose, so reading the client-facing copy
+    # here would report "0 cache writes" on every request of a relay that sends
+    # that field every single time -- which is exactly what it did before this
+    # line existed.
+    raw_usage = ctx.get("raw_usage") or usage
     base = int(FEATS.get("usage_baseline_tokens", 0) or 0)
     in_tok = int(usage.get("input_tokens", 0) or 0)
     raw_in = in_tok + base if base > 0 else in_tok
@@ -271,6 +294,11 @@ def make_rec(n, ctx, message=None, ok=True, status=0, note=""):
         "sent_tok": sys_tok + tools_tok + hist_tok,
         "in_tok": in_tok, "raw_in_tok": raw_in, "out_tok": int(usage.get("output_tokens", 0) or 0),
         "phantom_tok": max(0, raw_in - in_tok),
+        # what the relay claimed about caching. Kept so the dashboard can show
+        # whether a cache read ever came back -- it is the only way to tell that
+        # the breakpoint in build_payload is or is not doing anything.
+        "cache_read_tok": int(raw_usage.get("cache_read_input_tokens", 0) or 0),
+        "cache_write_tok": int(raw_usage.get("cache_creation_input_tokens", 0) or 0),
         "dur": round(time.time() - float(ctx.get("t0", time.time())), 1),
         "payload_chars": int(ctx.get("payload_chars", 0)),
         "ok": bool(ok), "status": int(status), "tools": int(ctx.get("n_tools", 0)),
@@ -289,8 +317,14 @@ def record(rec):
             STATS["stream_reqs"] += 1
         for k in ("in_tok", "out_tok", "raw_in_tok", "phantom_tok", "sys_tok",
                   "tools_tok", "hist_tok", "client_msgs", "sent_msgs",
-                  "raw_hist_tok", "raw_tools_tok", "saved_tok", "sent_tok"):
+                  "raw_hist_tok", "raw_tools_tok", "saved_tok", "sent_tok",
+                  "cache_read_tok", "cache_write_tok"):
             STATS[k] = STATS.get(k, 0) + int(rec.get(k, 0) or 0)
+        # how many requests came back with a cache read at all -- the count
+        # matters as much as the token total, because the total is a constant
+        # (10278) whenever it appears, from a 1.3k-char prefix or a 13.5k one.
+        if rec.get("cache_read_tok"):
+            STATS["cache_hit_reqs"] = STATS.get("cache_hit_reqs", 0) + 1
         STATS["duration"] = STATS.get("duration", 0.0) + float(rec.get("dur", 0) or 0)
         if not rec["ok"]:
             STATS["errors"].appendleft({"ts": rec["ts"], "n": rec["n"],
@@ -1846,9 +1880,31 @@ def process_upstream(upstream, client_req, feats, valid_names):
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": stop_val,
-        "usage": {"input_tokens": max(0, in_tok),
-                  "output_tokens": int(usage.get("output_tokens", 0) or 0)},
+        "usage": _usage_for_client(usage, in_tok),
     }, has_tool
+
+
+def _usage_for_client(usage, in_tok):
+    """The usage block Claude Code is handed.
+
+    `cache_read_input_tokens` is passed through when the relay reports one --
+    it is the only cache signal this relay gives that is worth anything.
+
+    `cache_creation_input_tokens` is deliberately NOT passed through. Measured
+    across eight requests: when the payload carries no cache_control the relay
+    reports `cache_creation_input_tokens = input_tokens - 2`, exactly, every
+    time -- i.e. "all of it was a cache write". That is a constant, not a
+    measurement. Forwarding it would tell Claude Code a cache is being filled
+    on every request.
+
+    (The read is not much better: see `note_cache` below.)
+    """
+    out = {"input_tokens": max(0, in_tok),
+           "output_tokens": int(usage.get("output_tokens", 0) or 0)}
+    rd = usage.get("cache_read_input_tokens")
+    if rd:
+        out["cache_read_input_tokens"] = int(rd)
+    return out
 
 
 def synthesize_sse(message, emit_start=True):
@@ -1995,6 +2051,7 @@ def v1_messages():
             status=status, content_type="application/json")
 
     message, has_tool = process_upstream(upstream, body, FEATS, valid_names)
+    ctx["raw_usage"] = upstream.get("usage") or {}
     log(f"REQ #{n} OK in {round(time.time() - t0, 1)}s | tool_use={has_tool} | "
         f"stop={message['stop_reason']} | usage={message['usage']}")
     if not has_tool and valid_names:
@@ -2065,6 +2122,7 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx):
         return
 
     message, has_tool = process_upstream(upstream, client_req, FEATS, valid_names)
+    ctx["raw_usage"] = upstream.get("usage") or {}
     log(f"stream OK in {round(time.time() - t0, 1)}s | tool_use={has_tool} | "
         f"stop={message['stop_reason']} | usage={message['usage']}")
     if not has_tool and valid_names:

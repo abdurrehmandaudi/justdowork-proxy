@@ -238,7 +238,62 @@ thinking tokens are output tokens: a 2,000-token budget costs **~68 seconds** at
 fresh user message), none on the turns that only execute it (each starts with a
 `tool_result`). `thinking_enabled: false` turns it off entirely.
 
-The offline suite grew from 84 to **115 checks**.
+The offline suite grew from 84 to **137 checks**.
+
+---
+
+### 8. Prompt caching — present, and doing nothing
+
+`cache_system_prefix` puts a `cache_control: {"type": "ephemeral"}` breakpoint on
+the last system block, the same place Anthropic's own clients put one. The relay
+**accepts** it and answers with a `cache_creation_input_tokens` /
+`cache_read_input_tokens` block. That is why it looked like caching worked.
+
+It does not. Measured directly against the relay on 2026-10-07, sweeping the
+cacheable prefix from 131 chars to 61,459:
+
+```
+ lines   sys chars   cache?   latency   in_tok  cache_write  cache_read
+     2         131      no      3.27s    10409        10407        None
+   200       13569     yes      3.28s    15161         4881       10278
+   900       61459      no      5.13s    31961        31959        None
+    20        1336     yes      2.51s    10841          561       10278
+```
+
+* **The read is always 10,278 tokens.** A 1,336-char prefix and a 13,569-char
+  prefix both come back as `cache_read = 10278`. That cannot be your prefix — it
+  is the relay's own hidden one. Nothing you send is ever served from cache.
+* **The write is `input_tokens - 2`, every time.** On requests with no
+  `cache_control` at all: `cache_write = 15159` against `in_tok = 15161`. That is
+  "everything was a write", which measures nothing.
+* **It never appears after a first write.** If the cache worked, request 1 would
+  write and requests 2..N would read. Instead the read shows up on a random
+  request — 1 of 8 through the proxy, and it was the *first* one.
+
+Live, through the proxy, eight identical requests:
+
+```
+cache_hit_reqs    1
+cache_read_tok    10278     <- the same 10278 as always
+cache_write_tok   109730    <- 15001 = in_tok - 2, seven times over
+```
+
+**So the breakpoint is kept** (it costs nothing, and would start helping if the
+relay ever implements the cache), but the proxy is honest about the result:
+
+* it **forwards** `cache_read_input_tokens` to Claude Code when one appears;
+* it **does not forward** `cache_creation_input_tokens` — that number is a
+  constant, and handing Claude Code "the cache just absorbed 15,001 tokens" on
+  every request would be a lie;
+* the **dashboard shows a Cache reads card** and marks each hit with a `cache`
+  pill, so this is visible without re-measuring it.
+
+A bug this turned up: the request record was being built from the *client-facing*
+usage block, which deliberately has `cache_creation_input_tokens` stripped — so
+the dashboard read 0 cache writes on a relay that sends that field every single
+time. The raw upstream usage is now carried on the request context
+(`ctx["raw_usage"]`) and read from there. The live traffic caught it; the test
+suite now pins it.
 
 ---
 
