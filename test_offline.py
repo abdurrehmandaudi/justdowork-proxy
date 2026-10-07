@@ -348,13 +348,14 @@ print("\n=== 4. Integration (mock upstream) ===")
 from flask import Flask, Response, request as freq  # noqa: E402
 
 mock = Flask("mock-upstream")
-MOCK = {"calls": [], "script": []}
+MOCK = {"calls": [], "headers": [], "script": []}
 
 
 @mock.route("/v1/messages", methods=["POST"])
 def mock_messages():
     body = freq.get_json(force=True)
     MOCK["calls"].append(body)
+    MOCK["headers"].append({k.lower(): v for k, v in freq.headers})
     idx = len(MOCK["calls"]) - 1
     script = MOCK["script"]
     entry = script[idx] if idx < len(script) else "done"

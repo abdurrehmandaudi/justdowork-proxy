@@ -275,8 +275,24 @@ def parse_response(msg, emulated_names):
     return out, has_tool
 
 
-def call_upstream(payload, version):
-    headers = {"x-api-key": KEY, "anthropic-version": version, "content-type": "application/json"}
+def get_request_api_key():
+    key = (request.headers.get("x-api-key") or "").strip()
+    if not key:
+        auth = (request.headers.get("authorization") or request.headers.get("Authorization") or "").strip()
+        if auth:
+            if auth.lower().startswith("bearer "):
+                key = auth[7:].strip()
+            else:
+                key = auth.strip()
+    if (not key or key == "dummy") and KEY:
+        key = KEY
+    return re.sub(r"[^\x21-\x7e]", "", key or "")
+
+
+def call_upstream(payload, version, api_key=None):
+    use_key = api_key or KEY
+    headers = {"x-api-key": use_key, "Authorization": f"Bearer {use_key}",
+               "anthropic-version": version, "content-type": "application/json"}
     return requests.post(f"{TARGET}/v1/messages", json=payload, headers=headers, timeout=600)
 
 
@@ -285,6 +301,10 @@ def proxy():
     counter["n"] += 1
     n = counter["n"]
     body = request.get_json(silent=True) or {}
+    req_key = get_request_api_key()
+    if not req_key:
+        return Response(json.dumps({"error": {"message": "No API key provided. Set ANTHROPIC_API_KEY in Claude Code."}}),
+                        status=401, content_type="application/json")
     wants_stream = bool(body.get("stream"))
     version = request.headers.get("anthropic-version", "2023-06-01")
 
@@ -301,7 +321,7 @@ def proxy():
     for attempt, aggressive in enumerate((False, True), start=1):
         payload = sanitize(body, aggressive=aggressive)
         try:
-            r = call_upstream(payload, version)
+            r = call_upstream(payload, version, api_key=req_key)
         except Exception as e:
             log(f"attempt {attempt} (aggressive={aggressive}) EXCEPTION: {e}")
             continue
@@ -365,7 +385,7 @@ def proxy():
 
 if __name__ == "__main__":
     if not KEY:
-        raise SystemExit("Pehle: export UPSTREAM_API_KEY='...'")
+        log("No UPSTREAM_API_KEY set; will forward ANTHROPIC_API_KEY from Claude Code.")
     open(LOG, "w").close()
     log(f"Agent proxy v3 on http://127.0.0.1:{PORT} -> {TARGET}")
     log(f"native map: {NAME_MAP}")

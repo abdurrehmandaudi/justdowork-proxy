@@ -46,14 +46,16 @@ if errorlevel 1 (
 
 rem Write the per-session settings to a file. Passing a JSON *string* through
 rem cmd.exe means fighting its quoting rules; a file path has no such problem.
+if "%ANTHROPIC_API_KEY%"=="" if not "%UPSTREAM_API_KEY%"=="" set "ANTHROPIC_API_KEY=%UPSTREAM_API_KEY%"
+if "%ANTHROPIC_API_KEY%"=="" set "ANTHROPIC_API_KEY=dummy"
+
 set "SETTINGS=%TEMP%\ccproxy-claude-settings.json"
-> "%SETTINGS%" echo {"env":{"ANTHROPIC_BASE_URL":"%PROXY%","ANTHROPIC_MODEL":"%MODEL%","ANTHROPIC_API_KEY":"dummy","ENABLE_TOOL_SEARCH":"false"}}
+> "%SETTINGS%" echo {"env":{"ANTHROPIC_BASE_URL":"%PROXY%","ANTHROPIC_MODEL":"%MODEL%","ANTHROPIC_API_KEY":"%ANTHROPIC_API_KEY%","ENABLE_TOOL_SEARCH":"false"}}
 
 rem Set the env vars too: whichever one Claude Code gives priority to, both
 rem point at the proxy.
 set "ANTHROPIC_BASE_URL=%PROXY%"
 set "ANTHROPIC_MODEL=%MODEL%"
-set "ANTHROPIC_API_KEY=dummy"
 set "ENABLE_TOOL_SEARCH=false"
 
 echo Claude Code  -^>  %PROXY%   (model: %MODEL%)
