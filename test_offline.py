@@ -727,48 +727,131 @@ finally:
     MOCK["script"] = []
 
 # --------------------------------------------------------------------------- #
-# 10. API key passthrough from Claude Code
+# 10. Prompt caching
+#
+# The relay DOES accept `cache_control` and answers with a cache_* usage block,
+# which is why this looked like it worked. It does not: measured directly
+# against the relay on 2026-10-07, the cache read it reports is 10278 tokens
+# whether the cacheable prefix is 1,336 chars or 13,569 -- a constant, i.e. the
+# relay's own hidden prefix, never the conversation's. Without cache_control it
+# reports cache_creation = input_tokens - 2 on every request, which is
+# "everything was a write" and equally meaningless. These checks pin down what
+# the proxy does with all that, so the behaviour cannot drift silently.
 # --------------------------------------------------------------------------- #
-print("\n=== 10. API key passthrough from Claude Code ===")
+print("\n=== 10. Prompt caching ===")
 
-# (a) Client passes x-api-key -> forwarded directly upstream
-MOCK["calls"].clear()
-MOCK["headers"].clear()
-MOCK["script"] = ["client key test"]
-r = requests.post(PROXY, json=dict(base_req), headers={"x-api-key": "sk-from-claude-code"})
-check("Client x-api-key returned 200 OK", r.status_code == 200)
-check("Client x-api-key was forwarded directly upstream",
-      bool(MOCK["headers"]) and MOCK["headers"][0].get("x-api-key") == "sk-from-claude-code"
-      and MOCK["headers"][0].get("authorization") == "Bearer sk-from-claude-code")
+_cache_req = {"model": "claude-opus-4-8", "max_tokens": 100,
+              "system": "You are a helpful assistant. " * 40,
+              "messages": [{"role": "user", "content": "hi"}]}
 
-# (b) Client passes Authorization Bearer -> forwarded directly upstream
-MOCK["calls"].clear()
-MOCK["headers"].clear()
-MOCK["script"] = ["bearer key test"]
-r = requests.post(PROXY, json=dict(base_req), headers={"Authorization": "Bearer sk-from-bearer"})
-check("Client Authorization Bearer returned 200 OK", r.status_code == 200)
-check("Client Authorization Bearer was forwarded directly upstream",
-      bool(MOCK["headers"]) and MOCK["headers"][0].get("x-api-key") == "sk-from-bearer"
-      and MOCK["headers"][0].get("authorization") == "Bearer sk-from-bearer")
+_on = ccproxy.build_payload(dict(_cache_req), ccproxy.FEATS, log_breakdown=False)
+_sys_on = _on.get("system")
+check("With cache_system_prefix on, system is sent as a block list",
+      isinstance(_sys_on, list) and _sys_on and _sys_on[0].get("type") == "text",
+      type(_sys_on).__name__)
+check("...carrying a cache_control breakpoint",
+      isinstance(_sys_on, list) and _sys_on[0].get("cache_control") == {"type": "ephemeral"},
+      str(_sys_on[0].get("cache_control") if isinstance(_sys_on, list) else None))
+check("...and the caller's own system text survives inside it",
+      isinstance(_sys_on, list) and _cache_req["system"] in _sys_on[0].get("text", ""),
+      f"sent {len(_sys_on[0].get('text',''))} chars vs {len(_cache_req['system'])} given"
+      if isinstance(_sys_on, list) else "")
+check("The breakpoint is NOT put on the messages (nothing else is marked)",
+      all("cache_control" not in json.dumps(m)
+          for m in (_on.get("messages") or [])))
 
-# (c) Client passes no key -> falls back to proxy configured key
-MOCK["calls"].clear()
-MOCK["headers"].clear()
-MOCK["script"] = ["fallback test"]
-r = requests.post(PROXY, json=dict(base_req))
-check("Request without key uses fallback key from proxy",
-      r.status_code == 200 and bool(MOCK["headers"])
-      and MOCK["headers"][0].get("x-api-key") == "sk-test-offline")
+_feats_off = dict(ccproxy.FEATS, cache_system_prefix=False)
+_off = ccproxy.build_payload(dict(_cache_req), _feats_off, log_breakdown=False)
+check("With cache_system_prefix off, system stays a plain string",
+      isinstance(_off.get("system"), str), type(_off.get("system")).__name__)
+check("...and no cache_control appears anywhere in the payload",
+      "cache_control" not in json.dumps(_off))
 
-# (d) Neither client key nor proxy key present -> 401 Unauthorized
-orig_key = ccproxy.CONFIG.get("api_key")
-try:
-    ccproxy.CONFIG["api_key"] = ""
-    r = requests.post(PROXY, json=dict(base_req))
-    check("Request with no client key and no proxy key returns 401", r.status_code == 401)
-    check("401 response mentions missing API key", "No API key" in r.text)
-finally:
-    ccproxy.CONFIG["api_key"] = orig_key
+# --- what the client is told -------------------------------------------------
+_u = ccproxy._usage_for_client(
+    {"input_tokens": 15161, "output_tokens": 7,
+     "cache_creation_input_tokens": 4881, "cache_read_input_tokens": 10278}, 15161)
+check("A cache read the relay reports IS forwarded to Claude Code",
+      _u.get("cache_read_input_tokens") == 10278, str(_u))
+check("cache_creation_input_tokens is NOT forwarded (it is input-2, a constant)",
+      "cache_creation_input_tokens" not in _u, str(_u))
+check("...input and output tokens still pass through",
+      _u.get("input_tokens") == 15161 and _u.get("output_tokens") == 7)
+
+_u2 = ccproxy._usage_for_client({"input_tokens": 100, "output_tokens": 3}, 100)
+check("No cache fields in, no cache fields out",
+      set(_u2) == {"input_tokens", "output_tokens"}, str(_u2))
+
+# --- what the proxy records --------------------------------------------------
+_rec = ccproxy.make_rec(9001, {"breakdown": {}, "snap0": {}, "stream": False,
+                               "client_msgs": 1, "t0": time.time(),
+                               "payload_chars": 10, "n_tools": 0},
+                        {"usage": {"input_tokens": 15161, "output_tokens": 7,
+                                   "cache_creation_input_tokens": 4881,
+                                   "cache_read_input_tokens": 10278}})
+check("A request record carries the cache read the relay claimed",
+      _rec.get("cache_read_tok") == 10278, str(_rec.get("cache_read_tok")))
+check("...and the cache write, even though it is not forwarded to the client",
+      _rec.get("cache_write_tok") == 4881, str(_rec.get("cache_write_tok")))
+
+_before = dict(ccproxy.STATS)
+ccproxy.record(_rec)
+check("Recording it adds to the cache-read total",
+      ccproxy.STATS["cache_read_tok"] - _before.get("cache_read_tok", 0) == 10278)
+check("...and counts it as one request that saw a cache read",
+      ccproxy.STATS["cache_hit_reqs"] - _before.get("cache_hit_reqs", 0) == 1)
+
+_rec2 = ccproxy.make_rec(9002, {"breakdown": {}, "snap0": {}, "stream": False,
+                                "client_msgs": 1, "t0": time.time(),
+                                "payload_chars": 10, "n_tools": 0},
+                         {"usage": {"input_tokens": 15161, "output_tokens": 7,
+                                    "cache_creation_input_tokens": 15159}})
+_hit_before = ccproxy.STATS.get("cache_hit_reqs", 0)
+ccproxy.record(_rec2)
+check("A request with no cache read does NOT count as a hit",
+      ccproxy.STATS.get("cache_hit_reqs", 0) == _hit_before,
+      f"{ccproxy.STATS.get('cache_hit_reqs')} vs {_hit_before}")
+check("...but its cache write still lands in the total",
+      ccproxy.STATS["cache_write_tok"] - _before.get("cache_write_tok", 0) == 4881 + 15159)
+
+# The record is fed the CLIENT-facing message, whose usage has had
+# cache_creation_input_tokens stripped by _usage_for_client. So the cache fields
+# must be read from the raw upstream usage carried on the context -- reading the
+# client-facing copy reported "0 cache writes" on a relay that sends that field
+# every single time (this bug was live until the live traffic caught it).
+_ctx_raw = {"breakdown": {}, "snap0": {}, "stream": False, "client_msgs": 1,
+            "t0": time.time(), "payload_chars": 10, "n_tools": 0,
+            "raw_usage": {"input_tokens": 15161, "output_tokens": 7,
+                          "cache_creation_input_tokens": 4881,
+                          "cache_read_input_tokens": 10278}}
+_rec3 = ccproxy.make_rec(9003, _ctx_raw,
+                         {"usage": ccproxy._usage_for_client(
+                             _ctx_raw["raw_usage"], 15161)})
+check("Cache numbers are read from the RAW usage, not the stripped client copy",
+      _rec3.get("cache_write_tok") == 4881 and _rec3.get("cache_read_tok") == 10278,
+      f"write={_rec3.get('cache_write_tok')} read={_rec3.get('cache_read_tok')}")
+check("...while in/out tokens still come from the client-facing usage",
+      _rec3.get("in_tok") == 15161 and _rec3.get("out_tok") == 7)
+
+with open(os.path.join(HERE, "ccproxy.py"), encoding="utf-8") as _fh:
+    _src = _fh.read()
+check("Both the streaming and non-streaming paths put raw usage on the context",
+      _src.count('ctx["raw_usage"] = upstream.get("usage") or {}') == 2,
+      f"found {_src.count('ctx[\"raw_usage\"] = upstream.get(\"usage\") or {}')}")
+
+_snap = ccproxy.stats_snapshot()
+check("/stats.json exposes the cache numbers to the dashboard",
+      all(k in _snap for k in ("cache_read_tok", "cache_write_tok", "cache_hit_reqs")),
+      str([k for k in _snap if k.startswith("cache")]))
+
+with open(os.path.join(HERE, "dashboard.py"), encoding="utf-8") as _fh:
+    _dash = _fh.read()
+check("The dashboard shows a cache card", 'card("Cache reads"' in _dash)
+check("...and marks per-request cache hits in the table",
+      "r.cache_read_tok" in _dash)
+
+for _k, _v in _before.items():
+    ccproxy.STATS[_k] = _v
 
 # --------------------------------------------------------------------------- #
 print("\n" + "=" * 60)

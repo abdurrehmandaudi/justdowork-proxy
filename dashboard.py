@@ -219,7 +219,18 @@ function render(s){
     card("Dropped calls", fmt(s.drops_total),
          s.drops_total ? "check the log" : "none", s.drops_total ? "bad" : "good") +
     card("Upstream calls", fmt(s.upstream_calls),
-         (s.retries_total||0) + " retry", (s.retries_total ? "warn" : ""));
+         (s.retries_total||0) + " retry", (s.retries_total ? "warn" : "")) +
+    // Measured 2026-10-07 with a direct probe: the relay reports a cache read
+    // of exactly 10278 tokens whether the cacheable prefix is 1.3k chars or
+    // 13.5k, and only on a random share of requests -- so that number is the
+    // relay's own hidden prefix, never the conversation's. The card is here so
+    // this stays visible instead of being a thing you have to go and measure.
+    card("Cache reads", fmt(s.cache_read_tok),
+         (s.cache_read_tok
+            ? s.cache_hit_reqs + " of " + reqs +
+              " requests &middot; a fixed ~10.3k, not your prefix"
+            : "none &mdash; the relay ignores the breakpoint"),
+         s.cache_read_tok ? "warn" : "");
 
   // ---- where the data goes ----
   var parts = [
@@ -305,6 +316,9 @@ function render(s){
     if (!r.ok) pills += '<span class="pill no">fail ' + r.status + '</span> ';
     if (r.stream) pills += '<span class="pill st">stream</span> ';
     if (Number(r.server_tools)) pills += '<span class="pill dr">web</span> ';
+    if (Number(r.cache_read_tok))
+      pills += '<span class="pill dr" title="relay reported a cache read of ' +
+               r.cache_read_tok + ' tokens">cache</span> ';
     var nm = (r.names || []).join(", ");
     rows += "<tr>" +
       "<td>" + r.n + "</td>" +

@@ -64,7 +64,17 @@ So a budget goes to the turn that *plans* (a fresh user message) and not to the
 turns that only execute that plan. Claude Code's own extended-thinking setting, if
 it is on, takes priority.
 
-`test_offline.py` grew from 70 to **115 checks**.
+And **prompt caching is now visible rather than mysterious**. The breakpoint was
+already there and the relay already answered with a cache block, so it looked like
+it worked. It does not: the read it reports is 10,278 tokens whatever you send — a
+1,336-char prefix and a 13,569-char prefix both come back as 10,278 — so that is
+the relay's own hidden prefix, never the conversation's, and it arrives on a random
+request instead of after a first write. The dashboard now shows a **Cache reads**
+card and marks each hit, and the proxy forwards the read to Claude Code while
+withholding the relay's invented write count. See
+[Prompt caching](#prompt-caching--it-is-in-here-and-it-does-nothing).
+
+`test_offline.py` grew from 70 to **137 checks**.
 
 ### v1.0.1 — PolyForm Noncommercial license
 
@@ -88,6 +98,7 @@ it is on, takes priority.
 | Thinking is supported by the relay but never requested | Adaptive extended thinking on the turn that *plans*; the mechanical turns stay fast |
 | A reply asking for three web searches made three round-trips | The proxy runs them together and feeds all the results back at once |
 | Adds ~10.4k phantom input tokens to every request | `usage_baseline_tokens` corrects the reported number (the real cost stays — that's the relay's) |
+| Accepts `cache_control` and answers with a cache block, so caching *looks* like it works | It does not — the read it reports is a constant 10,278 tokens whatever you send. The proxy forwards the read and shows hit rate on the dashboard, so this is visible instead of something you have to go and measure |
 
 ---
 
@@ -254,7 +265,7 @@ run-tests.bat            :: Windows
 Expected:
 
 ```
-RESULT:  115 pass, 0 fail
+RESULT:  137 pass, 0 fail
 ```
 
 ---
@@ -431,6 +442,60 @@ model went on to do.
 ```
 
 Set `thinking_enabled: false` for the fastest possible proxy.
+
+### Prompt caching — it is in here, and it does nothing
+
+`cache_system_prefix` puts a `cache_control: {"type": "ephemeral"}` breakpoint on
+the last system block, which is where Anthropic's own clients put one (the cache
+prefix runs tools → system → messages, so it covers the tool schemas too).
+
+The relay **accepts** it and answers with a `cache_creation_input_tokens` /
+`cache_read_input_tokens` block — which is why this looks like it works. It does
+not. Measured directly against the relay on 2026-10-07:
+
+```
+ lines   sys chars   ~sys tok  cache?   latency   in_tok  cache_write  cache_read
+     2         131         32      no     3.27s    10409        10407        None
+   200       13569       3392     yes     3.28s    15161         4881       10278
+   900       61459      15364      no     5.13s    31961        31959        None
+   200       13569       3392     yes     4.48s    15161         4881       10278
+    20        1336        334     yes     3.07s    10841        10839        None
+    20        1336        334     yes     2.51s    10841          561       10278
+```
+
+Three things fall out of that:
+
+* **The read is a constant.** 10,278 tokens, whether the cacheable prefix is
+  1,336 chars or 13,569. It cannot be your prefix — it is the relay's own hidden
+  one. Your system prompt, tool schemas and history are never served from cache.
+* **The write is `input_tokens - 2`.** On every request with no `cache_control`,
+  `cache_write = 15159` against `in_tok = 15161`. That is "all of it was a
+  write", on a request that had nothing to reuse. It is not a measurement.
+* **Nothing gets faster.** The requests that reported a read were not quicker
+  than the ones that did not.
+
+Through the proxy, eight identical requests, live:
+
+```
+cache_hit_reqs    1        <- one of eight
+cache_read_tok    10278    <- and it is the same 10278 as always
+cache_write_tok   109730   <- 15001 = in_tok - 2, seven times
+```
+
+The breakpoint is kept because it costs nothing and would start helping if the
+relay ever implements the cache properly. What the proxy does *not* do is pass
+the relay's invented `cache_creation_input_tokens` on to Claude Code — telling it
+a cache is being filled on every single request would be worse than saying
+nothing. The read **is** forwarded when one appears.
+
+The dashboard now shows a **Cache reads** card (total tokens, and how many of
+your requests saw one) and marks each hit with a `cache` pill in the request
+table, so this stays visible rather than being something you have to go and
+re-measure.
+
+```jsonc
+"cache_system_prefix": true,   // harmless; no measurable benefit at this relay
+```
 
 ---
 
