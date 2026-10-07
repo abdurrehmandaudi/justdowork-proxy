@@ -1384,9 +1384,9 @@ def execute_server_tool(name, tool_input, feats):
 # Upstream call
 # --------------------------------------------------------------------------- #
 
-def call_upstream(payload):
+def call_upstream(payload, api_key=None, version="2023-06-01"):
     url = CONFIG["upstream_base_url"] + "/v1/messages"
-    key = CONFIG.get("api_key") or ""
+    key = api_key or CONFIG.get("api_key") or ""
     headers = {"content-type": "application/json", "x-api-key": key,
                "Authorization": f"Bearer {key}", "anthropic-version": "2023-06-01"}
     attempts = max(1, int(FEATS.get("upstream_retries", 3) or 1))
@@ -1490,10 +1490,10 @@ def _salvage_truncated(upstream):
     return "".join(parts).strip()
 
 
-def resolve_server_tools(payload, feats):
+def resolve_server_tools(payload, feats, api_key=None, version="2023-06-01"):
     """Call upstream; if the model asked for a server-side web tool, run it here,
     feed the result back, and loop."""
-    status, upstream = call_upstream(payload)
+    status, upstream = call_upstream(payload, api_key=api_key, version=version)
     if not feats.get("server_tools_enabled", True):
         return status, upstream
     if status >= 400 or not isinstance(upstream, dict):
@@ -1536,7 +1536,7 @@ def resolve_server_tools(payload, feats):
             {"role": "user",
              "content": "\n\n".join(r.get("blocks") or r.get("text") or "(empty result)"
                                     for r in results)})
-        status, upstream = call_upstream(payload)
+        status, upstream = call_upstream(payload, api_key=api_key, version=version)
         if status >= 400 or not isinstance(upstream, dict):
             return status, upstream
     else:
@@ -1544,7 +1544,7 @@ def resolve_server_tools(payload, feats):
             {"role": "user",
              "content": "The tool limit is reached. Answer with what you already "
                         "know; do not call any tool."})
-        status, upstream = call_upstream(payload)
+        status, upstream = call_upstream(payload, api_key=api_key, version=version)
     return status, upstream
 
 
@@ -1564,11 +1564,11 @@ def make_fallback_payload(payload):
     return p
 
 
-def resolve_with_fallback(payload, feats):
-    status, upstream = resolve_server_tools(payload, feats)
+def resolve_with_fallback(payload, feats, api_key=None, version="2023-06-01"):
+    status, upstream = resolve_server_tools(payload, feats, api_key=api_key, version=version)
     if status in (400, 422):
         log(f"upstream returned {status} -> retrying with a slim payload")
-        status, upstream = resolve_server_tools(make_fallback_payload(payload), feats)
+        status, upstream = resolve_server_tools(make_fallback_payload(payload), feats, api_key=api_key, version=version)
     return status, upstream
 
 
@@ -1922,6 +1922,21 @@ def dump_request(n, obj):
 # Routes
 # --------------------------------------------------------------------------- #
 
+def get_request_api_key():
+    key = (request.headers.get("x-api-key") or "").strip()
+    if not key:
+        auth = (request.headers.get("authorization") or request.headers.get("Authorization") or "").strip()
+        if auth:
+            if auth.lower().startswith("bearer "):
+                key = auth[7:].strip()
+            else:
+                key = auth.strip()
+    # If client passed placeholder "dummy" but proxy has a configured key, fallback to configured
+    if (not key or key == "dummy") and CONFIG.get("api_key"):
+        key = CONFIG.get("api_key")
+    return re.sub(r"[^\x21-\x7e]", "", key or "")
+
+
 @app.route("/v1/messages", methods=["POST"])
 def v1_messages():
     COUNTER["n"] += 1
@@ -1931,6 +1946,13 @@ def v1_messages():
         return Response(json.dumps({"type": "error", "error": {
             "type": "invalid_request_error", "message": "the messages field is required"}}),
             status=400, content_type="application/json")
+
+    api_key = get_request_api_key()
+    if not api_key:
+        return Response(json.dumps({"type": "error", "error": {
+            "type": "authentication_error",
+            "message": "No API key found. Pass ANTHROPIC_API_KEY from Claude Code (x-api-key header) or set UPSTREAM_API_KEY in proxy config."}}),
+            status=401, content_type="application/json")
 
     wants_stream = bool(body.get("stream"))
     tools = [t for t in (body.get("tools") or []) if isinstance(t, dict)]
@@ -1953,13 +1975,13 @@ def v1_messages():
 
     if wants_stream:
         return Response(stream_with_context(
-            _stream(payload, body, valid_names, breakdown, t0, n, ctx)),
+            _stream(payload, body, valid_names, breakdown, t0, n, ctx, api_key=api_key)),
             content_type="text/event-stream; charset=utf-8",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
                      "Connection": "keep-alive"})
 
     try:
-        status, upstream = resolve_with_fallback(payload, FEATS)
+        status, upstream = resolve_with_fallback(payload, FEATS, api_key=api_key)
     except Exception as e:
         log(f"REQ #{n} upstream EXCEPTION: {e}")
         record(make_rec(n, ctx, ok=False, status=502, note=f"exception: {e}"))
@@ -1995,8 +2017,12 @@ def v1_messages():
             status=status, content_type="application/json")
 
     message, has_tool = process_upstream(upstream, body, FEATS, valid_names)
+    raw_u = upstream.get("usage") or {} if isinstance(upstream, dict) else {}
+    c_read = int(raw_u.get("cache_read_input_tokens") or raw_u.get("cache_read") or 0)
+    c_write = int(raw_u.get("cache_creation_input_tokens") or raw_u.get("cache_write") or raw_u.get("cache_creation") or 0)
     log(f"REQ #{n} OK in {round(time.time() - t0, 1)}s | tool_use={has_tool} | "
-        f"stop={message['stop_reason']} | usage={message['usage']}")
+        f"stop={message['stop_reason']} | usage={message['usage']} | "
+        f"cache read={c_read} cache write={c_write}")
     if not has_tool and valid_names:
         _said = " ".join(b.get("text", "") for b in (message.get("content") or [])
                          if isinstance(b, dict) and b.get("type") == "text")
@@ -2006,7 +2032,7 @@ def v1_messages():
     return Response(json.dumps(message), content_type="application/json")
 
 
-def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx):
+def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx, api_key=None):
     """Streaming: send message_start + a ping immediately, then run the upstream
     call in a background thread. That way Claude Code never sees dead air."""
     provisional = "msg_" + uuid.uuid4().hex[:16]
@@ -2020,7 +2046,7 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx):
 
     def worker():
         try:
-            box["v"] = resolve_with_fallback(payload, FEATS)
+            box["v"] = resolve_with_fallback(payload, FEATS, api_key=api_key)
         except Exception as e:
             box["e"] = e
 
@@ -2065,8 +2091,12 @@ def _stream(payload, client_req, valid_names, breakdown, t0, n, ctx):
         return
 
     message, has_tool = process_upstream(upstream, client_req, FEATS, valid_names)
+    raw_u = upstream.get("usage") or {} if isinstance(upstream, dict) else {}
+    c_read = int(raw_u.get("cache_read_input_tokens") or raw_u.get("cache_read") or 0)
+    c_write = int(raw_u.get("cache_creation_input_tokens") or raw_u.get("cache_write") or raw_u.get("cache_creation") or 0)
     log(f"stream OK in {round(time.time() - t0, 1)}s | tool_use={has_tool} | "
-        f"stop={message['stop_reason']} | usage={message['usage']}")
+        f"stop={message['stop_reason']} | usage={message['usage']} | "
+        f"cache read={c_read} cache write={c_write}")
     if not has_tool and valid_names:
         _said = " ".join(b.get("text", "") for b in (message.get("content") or [])
                          if isinstance(b, dict) and b.get("type") == "text")
@@ -2156,13 +2186,9 @@ def _shutdown(*_):
 
 if __name__ == "__main__":
     if not CONFIG.get("api_key"):
-        how = ('setx UPSTREAM_API_KEY "sk-..."    (then open a NEW terminal)'
-               if os.name == "nt" else
-               "export UPSTREAM_API_KEY='sk-...'")
-        print("!! UPSTREAM_API_KEY is not set. Either:\n"
-              f"     {how}\n"
-              '   or put the key into config.json as "api_key": "sk-...".')
-        sys.exit(1)
+        log("No static UPSTREAM_API_KEY set; forwarding ANTHROPIC_API_KEY directly from client requests.")
+    else:
+        log("Static UPSTREAM_API_KEY is configured as fallback.")
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
     host = CONFIG.get("listen_host", "127.0.0.1")

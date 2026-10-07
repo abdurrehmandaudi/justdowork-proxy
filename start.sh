@@ -33,12 +33,8 @@ if [ ! -x ".venv/bin/python3" ]; then
   ./.venv/bin/python3 -m pip install --quiet -r requirements.txt || exit 1
 fi
 
-# ccproxy itself also checks this, but failing here gives a clearer message.
 if [ -z "$UPSTREAM_API_KEY" ] && grep -q '"api_key": ""' config.json 2>/dev/null; then
-  echo "!! UPSTREAM_API_KEY is not set."
-  echo "   Run:  export UPSTREAM_API_KEY='sk-...'"
-  echo "   or put the key into config.json as \"api_key\": \"sk-...\""
-  exit 1
+  echo "Notice: UPSTREAM_API_KEY is not set. ccproxy will forward the key sent by Claude Code."
 fi
 
 echo

@@ -348,13 +348,14 @@ print("\n=== 4. Integration (mock upstream) ===")
 from flask import Flask, Response, request as freq  # noqa: E402
 
 mock = Flask("mock-upstream")
-MOCK = {"calls": [], "script": []}
+MOCK = {"calls": [], "headers": [], "script": []}
 
 
 @mock.route("/v1/messages", methods=["POST"])
 def mock_messages():
     body = freq.get_json(force=True)
     MOCK["calls"].append(body)
+    MOCK["headers"].append({k.lower(): v for k, v in freq.headers})
     idx = len(MOCK["calls"]) - 1
     script = MOCK["script"]
     entry = script[idx] if idx < len(script) else "done"
@@ -724,6 +725,50 @@ try:
 finally:
     ccproxy.execute_server_tool = _real_exec
     MOCK["script"] = []
+
+# --------------------------------------------------------------------------- #
+# 10. API key passthrough from Claude Code
+# --------------------------------------------------------------------------- #
+print("\n=== 10. API key passthrough from Claude Code ===")
+
+# (a) Client passes x-api-key -> forwarded directly upstream
+MOCK["calls"].clear()
+MOCK["headers"].clear()
+MOCK["script"] = ["client key test"]
+r = requests.post(PROXY, json=dict(base_req), headers={"x-api-key": "sk-from-claude-code"})
+check("Client x-api-key returned 200 OK", r.status_code == 200)
+check("Client x-api-key was forwarded directly upstream",
+      bool(MOCK["headers"]) and MOCK["headers"][0].get("x-api-key") == "sk-from-claude-code"
+      and MOCK["headers"][0].get("authorization") == "Bearer sk-from-claude-code")
+
+# (b) Client passes Authorization Bearer -> forwarded directly upstream
+MOCK["calls"].clear()
+MOCK["headers"].clear()
+MOCK["script"] = ["bearer key test"]
+r = requests.post(PROXY, json=dict(base_req), headers={"Authorization": "Bearer sk-from-bearer"})
+check("Client Authorization Bearer returned 200 OK", r.status_code == 200)
+check("Client Authorization Bearer was forwarded directly upstream",
+      bool(MOCK["headers"]) and MOCK["headers"][0].get("x-api-key") == "sk-from-bearer"
+      and MOCK["headers"][0].get("authorization") == "Bearer sk-from-bearer")
+
+# (c) Client passes no key -> falls back to proxy configured key
+MOCK["calls"].clear()
+MOCK["headers"].clear()
+MOCK["script"] = ["fallback test"]
+r = requests.post(PROXY, json=dict(base_req))
+check("Request without key uses fallback key from proxy",
+      r.status_code == 200 and bool(MOCK["headers"])
+      and MOCK["headers"][0].get("x-api-key") == "sk-test-offline")
+
+# (d) Neither client key nor proxy key present -> 401 Unauthorized
+orig_key = ccproxy.CONFIG.get("api_key")
+try:
+    ccproxy.CONFIG["api_key"] = ""
+    r = requests.post(PROXY, json=dict(base_req))
+    check("Request with no client key and no proxy key returns 401", r.status_code == 401)
+    check("401 response mentions missing API key", "No API key" in r.text)
+finally:
+    ccproxy.CONFIG["api_key"] = orig_key
 
 # --------------------------------------------------------------------------- #
 print("\n" + "=" * 60)

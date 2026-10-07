@@ -37,9 +37,15 @@ echo
 
 # Set the env vars AND pass --settings: whichever one Claude Code gives priority
 # to, both point at the proxy.
+ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-${UPSTREAM_API_KEY}}"
+if [ -z "$ANTHROPIC_KEY" ] && [ -f config.json ]; then
+  ANTHROPIC_KEY=$(grep -o '"api_key": "[^"]*' config.json 2>/dev/null | cut -d'"' -f4)
+fi
+ANTHROPIC_KEY="${ANTHROPIC_KEY:-dummy}"
+
 export ANTHROPIC_BASE_URL="$PROXY"
 export ANTHROPIC_MODEL="$MODEL"
-export ANTHROPIC_API_KEY="dummy"          # the real key lives inside the proxy
+export ANTHROPIC_API_KEY="$ANTHROPIC_KEY"
 export ENABLE_TOOL_SEARCH="false"         # the proxy relies on this being off
 
-exec claude --settings "{\"env\":{\"ANTHROPIC_BASE_URL\":\"$PROXY\",\"ANTHROPIC_MODEL\":\"$MODEL\",\"ANTHROPIC_API_KEY\":\"dummy\",\"ENABLE_TOOL_SEARCH\":\"false\"}}" "$@"
+exec claude --settings "{\"env\":{\"ANTHROPIC_BASE_URL\":\"$PROXY\",\"ANTHROPIC_MODEL\":\"$MODEL\",\"ANTHROPIC_API_KEY\":\"$ANTHROPIC_KEY\",\"ENABLE_TOOL_SEARCH\":\"false\"}}" "$@"
